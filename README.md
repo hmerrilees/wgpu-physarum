@@ -1,2 +1,4 @@
+# WGPU-physarum
+Implementation of Jeff Jones's [Physarum slime mold simulation](https://direct.mit.edu/artl/article-abstract/16/2/127/2650/Characteristics-of-Pattern-Formation-and-Evolution?redirectedFrom=fulltext)
 1. [Install Rust](https://www.rust-lang.org/tools/install)
 2. run `cargo run --release`
