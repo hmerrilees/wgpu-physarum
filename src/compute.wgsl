@@ -4,7 +4,7 @@ struct Particle {
 };
 
 struct SimParams {
-  deltaT : f32,
+  diffusionRate : f32,
   sensorAngle : f32,
   sensorDistance : f32,
   rotationAngle : f32,
@@ -107,4 +107,39 @@ vPos += vVel;
 
   // Write back
   particlesDst[index] = Particle(vPos, vVel);
+}
+
+
+// kernel blur
+@compute
+@workgroup_size(16, 16)
+fn blur(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
+  var texture_dims = textureDimensions(substrate);
+  var x = global_invocation_id.x;
+  var y = global_invocation_id.y;
+
+  if (x >= texture_dims.x || y >= texture_dims.y) {
+    return;
+  }
+
+  var color = textureLoad(substrate, vec2<u32>(x, y));
+  var sum = vec3<f32>(0.0, 0.0, 0.0);
+  var count = 0;
+
+  for (var dx : i32 = -1; dx <= 1; dx = dx + 1) {
+    for (var dy : i32 = -1; dy <= 1; dy = dy + 1) {
+      var nx = u32(i32(x) + dx);
+      var ny = u32(i32(y) + dy);
+      if (nx >= 0 && nx < texture_dims.x && ny >= 0 && ny < texture_dims.y) {
+        sum = sum + textureLoad(substrate, vec2<u32>(u32(nx), u32(ny))).rgb;
+        count = count + 1;
+      }
+    }
+  }
+
+  workgroupBarrier(); // todo check
+
+  var val = sum / f32(count) *  (1.0 - params.diffusionRate);
+  color = vec4<f32>(val, 1.0);
+  textureStore(substrate, vec2<u32>(x, y), color);
 }

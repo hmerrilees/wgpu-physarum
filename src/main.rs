@@ -8,12 +8,8 @@ use wgpu::Features;
 
 mod framework;
 
-// number of boid particles to simulate
 
 const NUM_PARTICLES: u32 = 1_000_000;
-
-// number of single-particle calculations (invocations) in each gpu work group
-
 const PARTICLES_PER_GROUP: u32 = 32;
 
 /// Example struct holds references to wgpu resources and frame persistent data
@@ -25,9 +21,11 @@ struct Example {
     substrate_texture: wgpu::Texture,
     substrate_bind_group: wgpu::BindGroup,
     compute_pipeline: wgpu::ComputePipeline,
+    blur_pipeline: wgpu::ComputePipeline,
     render_pipeline: wgpu::RenderPipeline,
     substrate_render_pipeline: wgpu::RenderPipeline,
     work_group_count: u32,
+    blur_work_group_count: (u32, u32),
     frame_num: usize,
 }
 
@@ -71,11 +69,11 @@ impl crate::framework::Example for Example {
         // buffer for simulation parameters uniform
 
         let sim_param_data = [
-            0.04f32,                              // deltaT
+            0.1,                              // diffusionRate
             22.5 / 360.0 * std::f32::consts::TAU, // sensorAngle
             9.0,                                  // sensorDistance
             45.0 / 360.0 * std::f32::consts::TAU, // rotationAngle
-            1.0 / 1200.0,                         // stepSize
+            1.0 / 150.0,                         // stepSize
         ]
         .to_vec();
         let sim_param_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -231,6 +229,13 @@ impl crate::framework::Example for Example {
             entry_point: "main",
         });
 
+        let blur_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Blur pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &compute_shader,
+            entry_point: "blur",
+        });
+
         // buffer for the three 2d triangle vertices of each instance
 
         let vertex_buffer_data = [-0.01f32, -0.02, 0.01, -0.02, 0.00, 0.02].map(|x| x / 10.0);
@@ -331,6 +336,11 @@ impl crate::framework::Example for Example {
         let work_group_count =
             ((NUM_PARTICLES as f32) / (PARTICLES_PER_GROUP as f32)).ceil() as u32;
 
+        let blur_work_group_count = (
+            ((config.width as f32) / 16.0).ceil() as u32,
+            ((config.height as f32) / 16.0).ceil() as u32,
+        );
+
         // returns Example struct and No encoder commands
         let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -349,10 +359,12 @@ impl crate::framework::Example for Example {
             substrate_texture,
             substrate_bind_group,
             compute_pipeline,
+            blur_pipeline,
             render_pipeline,
             substrate_render_pipeline,
             output_staging_buffer: staging_buffer,
             work_group_count,
+            blur_work_group_count,
             frame_num: 0,
         }
     }
@@ -422,7 +434,7 @@ impl crate::framework::Example for Example {
             );
         }
 
-        command_encoder.push_debug_group("compute boid movement");
+        command_encoder.push_debug_group("compute movement");
         {
             // compute pass
             let mut cpass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -432,6 +444,16 @@ impl crate::framework::Example for Example {
             cpass.set_pipeline(&self.compute_pipeline);
             cpass.set_bind_group(0, &self.particle_bind_groups[self.frame_num % 2], &[]);
             cpass.dispatch_workgroups(self.work_group_count, 1, 1);
+        }
+        {
+
+            let mut bpass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            bpass.set_pipeline(&self.blur_pipeline);
+            bpass.set_bind_group(0, &self.particle_bind_groups[self.frame_num % 2], &[]);
+            bpass.dispatch_workgroups(self.blur_work_group_count.0, self.blur_work_group_count.1, 1);
         }
         command_encoder.pop_debug_group();
 
@@ -467,7 +489,7 @@ impl crate::framework::Example for Example {
             },
         );
 
-        command_encoder.push_debug_group("render boids");
+        command_encoder.push_debug_group("render agents");
         {
             // render pass
             let mut rpass = command_encoder.begin_render_pass(&render_pass_descriptor);
@@ -490,5 +512,5 @@ impl crate::framework::Example for Example {
 
 /// run example
 pub fn main() {
-    crate::framework::run::<Example>("boids");
+    crate::framework::run::<Example>("Physarum");
 }
