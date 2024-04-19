@@ -4,12 +4,13 @@
 use nanorand::{Rng, WyRand};
 use std::{borrow::Cow, mem};
 use wgpu::util::DeviceExt;
+use wgpu::Features;
 
 mod framework;
 
 // number of boid particles to simulate
 
-const NUM_PARTICLES: u32 = 5000;
+const NUM_PARTICLES: u32 = 1_000_000;
 
 // number of single-particle calculations (invocations) in each gpu work group
 
@@ -20,13 +21,21 @@ struct Example {
     particle_bind_groups: Vec<wgpu::BindGroup>,
     particle_buffers: Vec<wgpu::Buffer>,
     vertices_buffer: wgpu::Buffer,
+    output_staging_buffer: wgpu::Buffer,
+    substrate_texture: wgpu::Texture,
+    substrate_bind_group: wgpu::BindGroup,
     compute_pipeline: wgpu::ComputePipeline,
     render_pipeline: wgpu::RenderPipeline,
+    substrate_render_pipeline: wgpu::RenderPipeline,
     work_group_count: u32,
     frame_num: usize,
 }
 
 impl crate::framework::Example for Example {
+    fn required_features() -> Features {
+        // TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+        Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+    }
     fn required_limits() -> wgpu::Limits {
         wgpu::Limits::downlevel_defaults()
     }
@@ -39,6 +48,7 @@ impl crate::framework::Example for Example {
     }
 
     /// constructs initial instance of Example struct
+    #[allow(clippy::too_many_lines)]
     fn init(
         config: &wgpu::SurfaceConfiguration,
         _adapter: &wgpu::Adapter,
@@ -53,17 +63,19 @@ impl crate::framework::Example for Example {
             label: None,
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("draw.wgsl"))),
         });
+        let substrate_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("substrate.wgsl"))),
+        });
 
         // buffer for simulation parameters uniform
 
         let sim_param_data = [
-            0.04f32, // deltaT
-            0.1,     // rule1Distance
-            0.025,   // rule2Distance
-            0.025,   // rule3Distance
-            0.02,    // rule1Scale
-            0.05,    // rule2Scale
-            0.005,   // rule3Scale
+            0.04f32,                              // deltaT
+            22.5 / 360.0 * std::f32::consts::TAU, // sensorAngle
+            9.0,                                  // sensorDistance
+            45.0 / 360.0 * std::f32::consts::TAU, // rotationAngle
+            1.0 / 1200.0,                         // stepSize
         ]
         .to_vec();
         let sim_param_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -95,7 +107,7 @@ impl crate::framework::Example for Example {
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new((NUM_PARTICLES * 16) as _),
+                            min_binding_size: wgpu::BufferSize::new(u64::from(NUM_PARTICLES * 16)),
                         },
                         count: None,
                     },
@@ -105,7 +117,17 @@ impl crate::framework::Example for Example {
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new((NUM_PARTICLES * 16) as _),
+                            min_binding_size: wgpu::BufferSize::new(u64::from(NUM_PARTICLES * 16)),
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::ReadWrite,
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            view_dimension: wgpu::TextureViewDimension::D2,
                         },
                         count: None,
                     },
@@ -158,6 +180,48 @@ impl crate::framework::Example for Example {
             multiview: None,
         });
 
+        let substrate_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::ReadOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                }],
+                label: None,
+            });
+
+        let substrate_render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("render"),
+                bind_group_layouts: &[&substrate_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        //
+        let substrate_render_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: Some(&substrate_render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &substrate_shader,
+                    entry_point: "substrate_vs",
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &substrate_shader,
+                    entry_point: "substrate_fs",
+                    targets: &[Some(config.view_formats[0].into())],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            });
+
         // create compute pipeline
 
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -169,7 +233,7 @@ impl crate::framework::Example for Example {
 
         // buffer for the three 2d triangle vertices of each instance
 
-        let vertex_buffer_data = [-0.01f32, -0.02, 0.01, -0.02, 0.00, 0.02];
+        let vertex_buffer_data = [-0.01f32, -0.02, 0.01, -0.02, 0.00, 0.02].map(|x| x / 10.0);
         let vertices_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
             contents: bytemuck::bytes_of(&vertex_buffer_data),
@@ -205,6 +269,34 @@ impl crate::framework::Example for Example {
             );
         }
 
+        let substrate_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Substrate Texture"),
+            size: wgpu::Extent3d {
+                width: config.width,
+                height: config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            view_formats: &[],
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+        });
+
+        let substrate_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &substrate_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(
+                    &substrate_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                ),
+            }],
+            label: None,
+        });
+
         // create two bind groups, one for each buffer as the src
         // where the alternate buffer is used as the dst
 
@@ -224,6 +316,12 @@ impl crate::framework::Example for Example {
                         binding: 2,
                         resource: particle_buffers[(i + 1) % 2].as_entire_binding(), // bind to opposite buffer
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(
+                            &substrate_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                        ),
+                    },
                 ],
                 label: None,
             }));
@@ -234,13 +332,26 @@ impl crate::framework::Example for Example {
             ((NUM_PARTICLES as f32) / (PARTICLES_PER_GROUP as f32)).ceil() as u32;
 
         // returns Example struct and No encoder commands
+        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(substrate_texture.width())
+                * u64::from(substrate_texture.height())
+                * 4
+                * 2,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
 
         Example {
             particle_bind_groups,
             particle_buffers,
             vertices_buffer,
+            substrate_texture,
+            substrate_bind_group,
             compute_pipeline,
             render_pipeline,
+            substrate_render_pipeline,
+            output_staging_buffer: staging_buffer,
             work_group_count,
             frame_num: 0,
         }
@@ -287,6 +398,30 @@ impl crate::framework::Example for Example {
         let mut command_encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
+        if self.frame_num < 10 {
+            command_encoder.copy_buffer_to_texture(
+                wgpu::ImageCopyBuffer {
+                    buffer: &self.output_staging_buffer,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some((4 * self.substrate_texture.width()) * 2),
+                        rows_per_image: Some(self.substrate_texture.height()),
+                    },
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &self.substrate_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.substrate_texture.width(),
+                    height: self.substrate_texture.height(),
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
         command_encoder.push_debug_group("compute boid movement");
         {
             // compute pass
@@ -299,6 +434,38 @@ impl crate::framework::Example for Example {
             cpass.dispatch_workgroups(self.work_group_count, 1, 1);
         }
         command_encoder.pop_debug_group();
+
+        command_encoder.push_debug_group("render substrate");
+        {
+            let mut srpass = command_encoder.begin_render_pass(&render_pass_descriptor);
+            srpass.set_pipeline(&self.substrate_render_pipeline);
+            srpass.set_bind_group(0, &self.substrate_bind_group, &[]);
+            srpass.draw(0..3, 0..2); // TODO
+        }
+        command_encoder.pop_debug_group();
+
+        command_encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &self.substrate_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &self.output_staging_buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    // This needs to be padded to 256.
+                    bytes_per_row: Some((4 * self.substrate_texture.width()) * 2),
+                    rows_per_image: Some(self.substrate_texture.height()),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.substrate_texture.width(),
+                height: self.substrate_texture.height(),
+                depth_or_array_layers: 1,
+            },
+        );
 
         command_encoder.push_debug_group("render boids");
         {

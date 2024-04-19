@@ -5,17 +5,16 @@ struct Particle {
 
 struct SimParams {
   deltaT : f32,
-  rule1Distance : f32,
-  rule2Distance : f32,
-  rule3Distance : f32,
-  rule1Scale : f32,
-  rule2Scale : f32,
-  rule3Scale : f32,
+  sensorAngle : f32,
+  sensorDistance : f32,
+  rotationAngle : f32,
+  stepSize : f32,
 };
 
 @group(0) @binding(0) var<uniform> params : SimParams;
 @group(0) @binding(1) var<storage, read> particlesSrc : array<Particle>;
 @group(0) @binding(2) var<storage, read_write> particlesDst : array<Particle>;
+@group(0) @binding(3) var substrate : texture_storage_2d<rgba16float, read_write>;
 
 // https://github.com/austinEng/Project6-Vulkan-Flocking/blob/master/data/shaders/computeparticles/particle.comp
 @compute
@@ -30,56 +29,49 @@ fn main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
   var vPos : vec2<f32> = particlesSrc[index].pos;
   var vVel : vec2<f32> = particlesSrc[index].vel;
 
-  var cMass : vec2<f32> = vec2<f32>(0.0, 0.0);
-  var cVel : vec2<f32> = vec2<f32>(0.0, 0.0);
-  var colVel : vec2<f32> = vec2<f32>(0.0, 0.0);
-  var cMassCount : i32 = 0;
-  var cVelCount : i32 = 0;
+  var angle = atan2(vVel.y, vVel.x);
 
-  var i : u32 = 0u;
-  loop {
-    if (i >= total) {
-      break;
-    }
-    if (i == index) {
-      continue;
-    }
+  // Physarum sensor
+    var sensorAngle = params.sensorAngle;
 
-    let pos = particlesSrc[i].pos;
-    let vel = particlesSrc[i].vel;
+    var left_sensor_angle = angle + sensorAngle;
+    var right_sensor_angle = angle - sensorAngle;
 
-    if (distance(pos, vPos) < params.rule1Distance) {
-      cMass += pos;
-      cMassCount += 1;
-    }
-    if (distance(pos, vPos) < params.rule2Distance) {
-      colVel -= pos - vPos;
-    }
-    if (distance(pos, vPos) < params.rule3Distance) {
-      cVel += vel;
-      cVelCount += 1;
-    }
+var left_sensor_offset = vec2<f32>(cos(left_sensor_angle), sin(left_sensor_angle));
+var center_sensor_offset = vec2<f32>(cos(angle), sin(angle));
+var right_sensor_offset = vec2<f32>(cos(right_sensor_angle), sin(right_sensor_angle));
 
-    continuing {
-      i = i + 1u;
-    }
-  }
-  if (cMassCount > 0) {
-    cMass = cMass * (1.0 / f32(cMassCount)) - vPos;
-  }
-  if (cVelCount > 0) {
-    cVel *= 1.0 / f32(cVelCount);
-  }
+var texture_dims = textureDimensions(substrate);
 
-  vVel = vVel + (cMass * params.rule1Scale) +
-      (colVel * params.rule2Scale) +
-      (cVel * params.rule3Scale);
+var texture_pos = vec2<f32>((vPos.x + 1.0) * 0.5 * f32(texture_dims.x), (vPos.y + 1.0) * 0.5 * f32(texture_dims.y));
 
-  // clamp velocity for a more pleasing simulation
-  vVel = normalize(vVel) * clamp(length(vVel), 0.0, 0.1);
+var left_sensor_pos = texture_pos + left_sensor_offset * params.sensorDistance;
+var center_sensor_pos = texture_pos + center_sensor_offset * params.sensorDistance;
+var right_sensor_pos = texture_pos + right_sensor_offset * params.sensorDistance;
 
-  // kinematic update
-  vPos += vVel * params.deltaT;
+var left_sensor_color = textureLoad(substrate, vec2<u32>(left_sensor_pos));
+var center_sensor_color = textureLoad(substrate, vec2<u32>(center_sensor_pos));
+var right_sensor_color = textureLoad(substrate, vec2<u32>(right_sensor_pos));
+
+var left_sensor_intensity = (left_sensor_color.r + left_sensor_color.g + left_sensor_color.b) / 3.0;
+var center_sensor_intensity = (center_sensor_color.r + center_sensor_color.g + center_sensor_color.b) / 3.0;
+var right_sensor_intensity = (right_sensor_color.r + right_sensor_color.g + right_sensor_color.b) / 3.0;
+
+// TODO check
+// center greatest, otherwise check left and right
+if (center_sensor_intensity > left_sensor_intensity && center_sensor_intensity > right_sensor_intensity) {
+    // do nothing
+    } else if (left_sensor_intensity > right_sensor_intensity) {
+    angle += params.rotationAngle;
+    } else if (right_sensor_intensity > left_sensor_intensity) {
+    angle -= params.rotationAngle;
+}
+// take step
+vVel = vec2<f32>(cos(angle), sin(angle)) * params.stepSize;
+vPos += vVel;
+
+
+
 
   // Wrap around boundary
   if (vPos.x < -1.0) {
@@ -94,6 +86,24 @@ fn main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
   if (vPos.y > 1.0) {
     vPos.y = -1.0;
   }
+
+  // draw trail
+  var x = u32((vPos.x + 1.0) * 0.5 * f32(textureDimensions(substrate).x));
+  var y = u32((vPos.y + 1.0) * 0.5 * f32(textureDimensions(substrate).y));
+
+  // if white within <3 tiles, flip direction and take a step
+  var accum = vec3<f32>(0.0, 0.0, 0.0);
+
+
+
+  // add .1 to color
+      if (x < textureDimensions(substrate).x && y < textureDimensions(substrate).y) {
+        var color = textureLoad(substrate, vec2<u32>(x, y));
+        color.r = min(color.r + 0.1, 1.0);
+        color.g = min(color.g + 0.1, 1.0);
+        color.b = min(color.b + 0.1, 1.0);
+        textureStore(substrate, vec2<u32>(x, y), color);
+      }
 
   // Write back
   particlesDst[index] = Particle(vPos, vVel);
